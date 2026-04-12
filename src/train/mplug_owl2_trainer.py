@@ -203,7 +203,11 @@ class MPLUGOwl2Trainer(Trainer):
                         "weight_decay": 0.0,
                     },
                 ]
-            ic(len(optimizer_grouped_parameters[0]['params']),len(optimizer_grouped_parameters[1]['params']))
+            logger.info(
+                "optimizer params groups: decay=%d, no_decay=%d",
+                len(optimizer_grouped_parameters[0]["params"]),
+                len(optimizer_grouped_parameters[1]["params"]),
+            )
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             if True:

@@ -12,6 +12,13 @@ def parse_args():
     parser.add_argument("--pred_paths", type=str, required=True, nargs="+")
     parser.add_argument("--gt_paths", type=str, required=True, nargs="+")
     parser.add_argument("--use_openset_probs", action="store_true")
+    parser.add_argument(
+        "--target_key",
+        type=str,
+        default="mos_align",
+        choices=["mos_align", "mos_quality"],
+        help="Which GT field to evaluate against."
+    )
     args = parser.parse_args()
     return args
 
@@ -80,6 +87,7 @@ if __name__ == "__main__":
     pred_paths = args.pred_paths
     gt_paths = args.gt_paths
     use_openset_probs = args.use_openset_probs
+    target_key = args.target_key
 
     for pred_path, gt_path in zip(pred_paths, gt_paths):
         print("=" * 100)
@@ -106,7 +114,7 @@ if __name__ == "__main__":
             else:
                 pred_score = cal_score(level_names, logits=pred_meta["logits"], use_openset_probs=False)
             preds.append(pred_score)
-            gts.append(gt_meta["gt_score"])
+            gts.append(gt_meta[target_key])
 
         preds_fit = fit_curve(preds, gts)
         srcc = calculate_srcc(preds_fit, gts)

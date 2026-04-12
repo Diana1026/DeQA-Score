@@ -46,18 +46,16 @@ def expand2square(pil_img, background_color):
         return result
 
 
-def build_question(text_prompt=None, fact=None):
+def build_question(text_prompt):
     """
-    Build a VQA-style yes/no question.
+    Build a VQA-style yes/no question for full prompt alignment.
     """
-    if fact is not None:
-        return f'Does this image support the statement "{fact}"? Please answer yes or no.'
     return f'Does this image match the text prompt "{text_prompt}"? Please answer yes or no.'
 
 
 def build_vqa_prompt(conv_mode, question):
     """
-    Build the full conversational prompt for mPLUG-Owl2 / LLaVA-style model.
+    Build the conversational prompt for mPLUG-Owl2 style models.
     """
     conv = conv_templates[conv_mode].copy()
     inp = f"{DEFAULT_IMAGE_TOKEN}\n{question}"
@@ -66,42 +64,37 @@ def build_vqa_prompt(conv_mode, question):
     return conv.get_prompt()
 
 
-def aggregate_fact_scores(fact_scores, mode="mean", tau=5.0):
-    if len(fact_scores) == 0:
-        return None
-
-    if mode == "mean":
-        return sum(fact_scores) / len(fact_scores)
-
-    if mode == "min":
-        return min(fact_scores)
-
-    if mode == "softmin":
-        weights = [math.exp(-tau * s) for s in fact_scores]
-        denom = sum(weights) + 1e-12
-        return sum(w * s for w, s in zip(weights, fact_scores)) / denom
-
-    raise ValueError(f"Unsupported aggregation mode: {mode}")
+def pad_input_ids(input_ids_list, pad_token_id):
+    """
+    Pad variable-length tokenized prompts into a batch tensor.
+    """
+    max_len = max(x.shape[0] for x in input_ids_list)
+    padded = []
+    for x in input_ids_list:
+        pad_len = max_len - x.shape[0]
+        if pad_len > 0:
+            pad = torch.full(
+                (pad_len,),
+                pad_token_id,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            x = torch.cat([x, pad], dim=0)
+        padded.append(x)
+    return torch.stack(padded, dim=0)
 
 
 def sequence_probability_from_loss(loss_value):
     """
-    Convert average CE loss to exp(-loss), matching VQAScore-style scoring.
+    Convert average CE loss to sequence probability score.
     """
     return math.exp(-float(loss_value))
 
 
-def compute_answer_score(
-    model,
-    tokenizer,
-    image_tensor,
-    prompt,
-    answer,
-    device,
-):
+def compute_answer_score(model, tokenizer, image_tensor, prompt, answer, device):
     """
-    Compute sequence probability score for a target answer under teacher forcing.
-    Score = exp(-loss(answer | prompt, image))
+    Compute score(answer | prompt, image) using teacher forcing.
+    Returns exp(-loss).
     """
     prompt_ids = tokenizer_image_token(
         prompt,
@@ -119,7 +112,7 @@ def compute_answer_score(
     input_ids = torch.cat([prompt_ids, answer_ids], dim=1)
 
     labels = input_ids.clone()
-    labels[:, : prompt_ids.shape[1]] = -100
+    labels[:, :prompt_ids.shape[1]] = -100
 
     with torch.inference_mode():
         outputs = model(
@@ -134,112 +127,6 @@ def compute_answer_score(
             loss = outputs.loss
 
     return sequence_probability_from_loss(loss.item())
-
-
-def flush_batch(
-    model,
-    tokenizer,
-    image_tensors,
-    batch_data,
-    save_path,
-    device,
-    conv_mode,
-    aggregate_mode="mean",
-    debug=False,
-):
-    """
-    Score a batch sample-by-sample using VQA-style Yes/No sequence probabilities.
-    Returns emptied batch containers.
-    """
-    if len(batch_data) == 0:
-        return [], []
-
-    grouped_results = {}
-
-    for image_tensor, entry in zip(image_tensors, batch_data):
-        sid = entry["sample_id"]
-        if sid not in grouped_results:
-            grouped_results[sid] = {
-                "id": sid,
-                "image": entry["image"],
-                "prompt": entry["prompt"],
-                "mos_align": entry["mos_align"],
-                "std_align": entry["std_align"],
-                "mos_quality": entry["mos_quality"],
-                "std_quality": entry["std_quality"],
-                "fact_results": [],
-            }
-
-        if entry["fact"] is not None:
-            question = build_question(fact=entry["fact"])
-        else:
-            question = build_question(text_prompt=entry["prompt"])
-
-        full_prompt = build_vqa_prompt(conv_mode, question)
-
-        score_yes = compute_answer_score(
-            model=model,
-            tokenizer=tokenizer,
-            image_tensor=image_tensor,
-            prompt=full_prompt,
-            answer="Yes",
-            device=device,
-        )
-        score_no = compute_answer_score(
-            model=model,
-            tokenizer=tokenizer,
-            image_tensor=image_tensor,
-            prompt=full_prompt,
-            answer="No",
-            device=device,
-        )
-
-        denom = score_yes + score_no + 1e-12
-        p_yes = score_yes / denom
-        p_no = score_no / denom
-
-        fact_result = {
-            "fact": entry["fact"],
-            "fact_meta": entry["fact_meta"],
-            "question": question,
-            "score_yes": score_yes,
-            "score_no": score_no,
-            "p_yes": p_yes,
-            "p_no": p_no,
-            "fact_score": p_yes,
-        }
-
-        if debug:
-            fact_result["full_prompt"] = full_prompt
-
-        grouped_results[sid]["fact_results"].append(fact_result)
-
-    with open(save_path, "a", encoding="utf-8") as fw:
-        for _, meta_res in grouped_results.items():
-            fact_scores = [
-                x["fact_score"]
-                for x in meta_res["fact_results"]
-                if "fact_score" in x
-            ]
-
-            meta_res["pred_score_mean"] = aggregate_fact_scores(
-                fact_scores, mode="mean"
-            )
-            meta_res["pred_score_min"] = aggregate_fact_scores(
-                fact_scores, mode="min"
-            )
-            meta_res["pred_score_softmin"] = aggregate_fact_scores(
-                fact_scores, mode="softmin"
-            )
-            meta_res["pred_score"] = aggregate_fact_scores(
-                fact_scores, mode=aggregate_mode
-            )
-            meta_res["aggregation_mode"] = aggregate_mode
-
-            fw.write(json.dumps(meta_res, ensure_ascii=False) + "\n")
-
-    torch.cuda.empty_cache()
-    return [], []
 
 
 def main(args):
@@ -257,7 +144,6 @@ def main(args):
     )
 
     meta_paths = args.meta_paths
-    batch_size = args.batch_size
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
 
@@ -266,9 +152,6 @@ def main(args):
     for meta_path in meta_paths:
         with open(meta_path, "r", encoding="utf-8") as f:
             iqadata = json.load(f)
-
-        image_tensors = []
-        batch_data = []
 
         handled_ids = set()
         save_path = os.path.join(save_dir, os.path.basename(meta_path))
@@ -284,98 +167,69 @@ def main(args):
 
         meta_name = os.path.basename(meta_path)
 
-        for _, llddata in enumerate(tqdm(iqadata, desc=f"Evaluating [{meta_name}]")):
-            sample_id = llddata["id"]
-            if sample_id in handled_ids:
-                continue
+        with open(save_path, "a", encoding="utf-8") as fw:
+            for llddata in tqdm(iqadata, desc=f"Evaluating [{meta_name}]"):
+                sample_id = llddata["id"]
+                if sample_id in handled_ids:
+                    continue
 
-            filename = llddata["image"]
-            text_prompt = llddata["prompt"]
-            decomposition = llddata.get("decomposition", [])
+                filename = llddata["image"]
+                text_prompt = llddata["prompt"]
 
-            image = load_image(filename)
-            image = expand2square(
-                image,
-                tuple(int(x * 255) for x in image_processor.image_mean),
-            )
-            image_tensor = image_processor.preprocess(
-                image,
-                return_tensors="pt",
-            )["pixel_values"].half()
+                image = load_image(filename)
+                image = expand2square(
+                    image, tuple(int(x * 255) for x in image_processor.image_mean)
+                )
+                image_tensor = image_processor.preprocess(
+                    image, return_tensors="pt"
+                )["pixel_values"].half()
 
-            if decomposition and isinstance(decomposition, list):
-                for fact_item in decomposition:
-                    fact_text = fact_item.get("fact", "").strip()
-                    if not fact_text:
-                        continue
+                question = build_question(text_prompt)
+                full_prompt = build_vqa_prompt(conv_mode, question)
 
-                    image_tensors.append(image_tensor)
-                    batch_data.append(
-                        {
-                            "sample_id": llddata["id"],
-                            "image": llddata["image"],
-                            "prompt": llddata["prompt"],
-                            "mos_align": llddata.get("mos_align", None),
-                            "std_align": llddata.get("std_align", None),
-                            "mos_quality": llddata.get("mos_quality", None),
-                            "std_quality": llddata.get("std_quality", None),
-                            "fact": fact_text,
-                            "fact_meta": fact_item,
-                        }
-                    )
-
-                    if len(batch_data) >= batch_size:
-                        image_tensors, batch_data = flush_batch(
-                            model=model,
-                            tokenizer=tokenizer,
-                            image_tensors=image_tensors,
-                            batch_data=batch_data,
-                            save_path=save_path,
-                            device=args.device,
-                            conv_mode=conv_mode,
-                            aggregate_mode=args.aggregate_mode,
-                            debug=args.debug,
-                        )
-            else:
-                image_tensors.append(image_tensor)
-                batch_data.append(
-                    {
-                        "sample_id": llddata["id"],
-                        "image": llddata["image"],
-                        "prompt": llddata["prompt"],
-                        "mos_align": llddata.get("mos_align", None),
-                        "std_align": llddata.get("std_align", None),
-                        "mos_quality": llddata.get("mos_quality", None),
-                        "std_quality": llddata.get("std_quality", None),
-                        "fact": None,
-                        "fact_meta": None,
-                    }
+                score_yes = compute_answer_score(
+                    model=model,
+                    tokenizer=tokenizer,
+                    image_tensor=image_tensor,
+                    prompt=full_prompt,
+                    answer="Yes",
+                    device=args.device,
+                )
+                score_no = compute_answer_score(
+                    model=model,
+                    tokenizer=tokenizer,
+                    image_tensor=image_tensor,
+                    prompt=full_prompt,
+                    answer="No",
+                    device=args.device,
                 )
 
-                if len(batch_data) >= batch_size:
-                    image_tensors, batch_data = flush_batch(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image_tensors=image_tensors,
-                        batch_data=batch_data,
-                        save_path=save_path,
-                        device=args.device,
-                        conv_mode=conv_mode,
-                        aggregate_mode=args.aggregate_mode,
-                        debug=args.debug,
-                    )
+                denom = score_yes + score_no + 1e-12
+                p_yes = score_yes / denom
+                p_no = score_no / denom
 
-        image_tensors, batch_data = flush_batch(
-            model=model,
-            tokenizer=tokenizer,
-            image_tensors=image_tensors,
-            batch_data=batch_data,
-            save_path=save_path,
-            device=args.device,
-            conv_mode=conv_mode,
-            aggregate_mode=args.aggregate_mode,
-            debug=args.debug,
-        )
+                meta_res = {
+                    "id": llddata["id"],
+                    "image": llddata["image"],
+                    "prompt": llddata["prompt"],
+                    "mos_align": llddata.get("mos_align", None),
+                    "std_align": llddata.get("std_align", None),
+                    "mos_quality": llddata.get("mos_quality", None),
+                    "std_quality": llddata.get("std_quality", None),
+                    "question": question,
+                    "score_yes": score_yes,
+                    "score_no": score_no,
+                    "p_yes": p_yes,
+                    "p_no": p_no,
+                    "pred_score": p_yes,
+                }
+
+                if args.debug:
+                    meta_res["full_prompt"] = full_prompt
+
+                fw.write(json.dumps(meta_res, ensure_ascii=False) + "\n")
+
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -385,17 +239,16 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessor-path", type=str, default=None)
     parser.add_argument("--meta-paths", type=str, required=True, nargs="+")
     parser.add_argument("--root-dir", type=str, default="")
-    parser.add_argument("--save-dir", type=str, default="results_vqa_style")
+    parser.add_argument("--save-dir", type=str, default="results_vqa_style_no_decomp")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--conv-mode", type=str, default="mplug_owl2")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--aggregate-mode", type=str, default="mean", choices=["mean", "min", "softmin"])
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--image-aspect-ratio", type=str, default="pad")
     args = parser.parse_args()
     main(args)
+
 
 # import argparse
 # import json

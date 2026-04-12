@@ -16,6 +16,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -41,6 +42,15 @@ IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<|image|>"
 from icecream import ic
 
+@dataclass
+class AlignmentOutput(CausalLMOutputWithPast):
+    global_align_score: Optional[torch.FloatTensor] = None
+    decomp_scores: Optional[torch.FloatTensor] = None
+    decomp_gate: Optional[torch.FloatTensor] = None
+    fused_decomp_score: Optional[torch.FloatTensor] = None
+    final_align_score: Optional[torch.FloatTensor] = None
+    diversity_loss: Optional[torch.FloatTensor] = None
+    align_loss: Optional[torch.FloatTensor] = None
 
 class MPLUGOwl2MetaModel:
     def __init__(self, config):
@@ -337,11 +347,260 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # ===== latent decomposition for alignment =====
+        self.use_decomp_embeddings = getattr(config, "use_decomp_embeddings", False)
+        self.num_decomp_tokens = getattr(config, "num_decomp_tokens", 4)
+        self.weight_decomp = getattr(config, "weight_decomp", 1.0)
+        self.weight_diversity = getattr(config, "weight_diversity", 0.01)
+        self.decomp_fusion_type = getattr(config, "decomp_fusion_type", "gated_sum")
+        self.align_loss_type = getattr(config, "align_loss_type", "mse")
+        self.align_soft_kl_weight = getattr(config, "align_soft_kl_weight", 0.0)
+        self.align_soft_kl_tau = getattr(config, "align_soft_kl_tau", 0.5)
+        self.align_consistency_weight = getattr(config, "align_consistency_weight", 0.0)
+        self.align_rank_weight = getattr(config, "align_rank_weight", 0.0)
+        self.align_rank_margin = getattr(config, "align_rank_margin", 0.0)
+
+        hidden_size = config.hidden_size
+
+        if self.use_decomp_embeddings:
+            self.enable_decomp_embeddings(self.num_decomp_tokens)
+
         # Initialize weights and apply final processing
         self.post_init()
 
+    def enable_decomp_embeddings(self, num_decomp_tokens=None):
+        if num_decomp_tokens is not None:
+            self.num_decomp_tokens = num_decomp_tokens
+        self.use_decomp_embeddings = True
+        self.config.use_decomp_embeddings = True
+        self.config.num_decomp_tokens = self.num_decomp_tokens
+
+        hidden_size = self.config.hidden_size
+
+        if not hasattr(self, "decomp_queries"):
+            self.decomp_queries = nn.Parameter(
+                torch.randn(self.num_decomp_tokens, hidden_size) * 0.02
+            )
+        if not hasattr(self, "decomp_key_proj"):
+            self.decomp_key_proj = nn.Linear(hidden_size, hidden_size)
+        if not hasattr(self, "decomp_value_proj"):
+            self.decomp_value_proj = nn.Linear(hidden_size, hidden_size)
+        if not hasattr(self, "global_align_head"):
+            self.global_align_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, 1),
+            )
+        if not hasattr(self, "decomp_align_head"):
+            self.decomp_align_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, 1),
+            )
+        if not hasattr(self, "decomp_gate"):
+            self.decomp_gate = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, 1),
+            )
+
+        # When enabled after model loading, newly created modules default to CPU/FP32.
+        # Keep them aligned with the existing model weights to avoid device mismatches.
+        ref_param = self.lm_head.weight
+        target_device = ref_param.device
+        target_dtype = ref_param.dtype
+        self.decomp_queries.data = self.decomp_queries.data.to(
+            device=target_device, dtype=target_dtype
+        )
+        self.decomp_key_proj.to(device=target_device, dtype=target_dtype)
+        self.decomp_value_proj.to(device=target_device, dtype=target_dtype)
+        self.global_align_head.to(device=target_device, dtype=target_dtype)
+        self.decomp_align_head.to(device=target_device, dtype=target_dtype)
+        self.decomp_gate.to(device=target_device, dtype=target_dtype)
+
     def get_model(self):
         return self.model
+
+    def pool_hidden(self, hidden_states, attention_mask=None):
+        """
+        hidden_states: [B, T, H]
+        use masked mean pooling if attention_mask exists, else last token
+        """
+        if attention_mask is None:
+            return hidden_states[:, -1, :]
+
+        mask = attention_mask.to(hidden_states.dtype).unsqueeze(-1)  # [B, T, 1]
+        denom = mask.sum(dim=1).clamp(min=1e-6)
+        pooled = (hidden_states * mask).sum(dim=1) / denom
+        return pooled
+
+    def compute_decomp_alignment(
+        self, hidden_states, attention_mask=None, modality_indicators=None
+    ):
+        """
+        hidden_states: [B, T, H]
+        returns dict of latent decomposition outputs
+        """
+        B, T, H = hidden_states.shape
+
+        # Keep global score path inactive for now (use pure VQA p_yes as main score).
+        global_align_score = hidden_states.new_zeros(B)
+
+        # [K, H] -> [B, K, H], conditioned on the current prompt tokens.
+        decomp_queries = self.decomp_queries.unsqueeze(0).expand(B, -1, -1)
+        key_states = self.decomp_key_proj(hidden_states)
+        value_states = self.decomp_value_proj(hidden_states)
+
+        # latent slots attend over token sequence and extract prompt-dependent units
+        attn_logits = torch.matmul(
+            decomp_queries, key_states.transpose(1, 2)
+        ) / (H ** 0.5)  # [B, K, T]
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).bool()  # [B, 1, T]
+            attn_logits = attn_logits.masked_fill(~mask, -1e4)
+        if modality_indicators is not None:
+            text_mask = (modality_indicators == 0).unsqueeze(1).bool()  # [B, 1, T]
+            attn_logits = attn_logits.masked_fill(~text_mask, -1e4)
+
+        attn = torch.softmax(attn_logits, dim=-1)  # [B, K, T]
+        decomp_repr = torch.matmul(attn, value_states)  # [B, K, H]
+
+        decomp_scores = self.decomp_align_head(decomp_repr).squeeze(-1)  # [B, K]
+        gate_logits = self.decomp_gate(decomp_repr).squeeze(-1)          # [B, K]
+        gate = torch.softmax(gate_logits, dim=-1)
+
+        if self.decomp_fusion_type == "mean":
+            fused_decomp_score = decomp_scores.mean(dim=-1)
+        else:
+            fused_decomp_score = (gate * decomp_scores).sum(dim=-1)
+
+        # Decomposition residual is kept as a separate auxiliary score/logit.
+        final_align_score = self.weight_decomp * fused_decomp_score
+
+        # diversity loss over latent decomp queries
+        Z = F.normalize(self.decomp_queries, dim=-1)   # [K, H]
+        sim = torch.matmul(Z, Z.t())                      # [K, K]
+        I = torch.eye(sim.size(0), device=sim.device, dtype=sim.dtype)
+        diversity_loss = ((sim - I) ** 2).mean()
+
+        return {
+            "global_align_score": global_align_score,
+            "decomp_scores": decomp_scores,
+            "decomp_gate": gate,
+            "fused_decomp_score": fused_decomp_score,
+            "final_align_score": final_align_score,
+            "diversity_loss": diversity_loss,
+        }
+
+    def compute_alignment_loss(
+        self,
+        pred,
+        target,
+        logits=None,
+        attention_mask=None,
+        decomp_aux_logit=None,
+    ):
+        align_loss_type = getattr(
+            self.config, "align_loss_type", getattr(self, "align_loss_type", "mse")
+        )
+
+        def _soft_level_dist(score_1to5, tau):
+            centers = torch.arange(1, 6, device=score_1to5.device, dtype=score_1to5.dtype)
+            logits_level = -((score_1to5.unsqueeze(-1) - centers) ** 2) / tau
+            return torch.softmax(logits_level, dim=-1)
+
+        target = target.to(device=pred.device, dtype=pred.dtype)
+        valid = target > -1e4
+        if not valid.any():
+            return pred.new_zeros(())
+        target = target[valid]
+        pred = pred[valid]
+        if decomp_aux_logit is not None:
+            decomp_aux_logit = decomp_aux_logit[valid]
+        rank_pred = pred
+        base_loss = None
+        if align_loss_type == "vqa_yesprob_bce":
+            if logits is None or attention_mask is None:
+                raise ValueError("logits and attention_mask are required for vqa_yesprob_bce")
+
+            yes_id = getattr(self.config, "align_yes_token_id", None)
+            no_id = getattr(self.config, "align_no_token_id", None)
+            if yes_id is None or no_id is None:
+                raise ValueError("align_yes_token_id / align_no_token_id are not set in config")
+
+            logits_valid = logits[valid]
+            attn_valid = attention_mask[valid]
+            last_pos = attn_valid.long().sum(dim=1) - 1  # position of last prompt token
+            vocab_size = logits_valid.shape[-1]
+            gather_index = last_pos.view(-1, 1, 1).expand(-1, 1, vocab_size)
+            next_logits = logits_valid.gather(dim=1, index=gather_index).squeeze(1)
+
+            yes_logit = next_logits[:, yes_id]
+            no_logit = next_logits[:, no_id]
+            # Main score strictly follows VQA yes/no margin.
+            margin_logit = yes_logit - no_logit
+            target_prob = ((target - 1.0) / 4.0).clamp(0.0, 1.0).to(margin_logit.dtype)
+            rank_pred = margin_logit
+            base_loss = F.binary_cross_entropy_with_logits(margin_logit, target_prob)
+
+            # Decomposition branch is optimized as an auxiliary head, not fused into main p_yes.
+            if decomp_aux_logit is not None:
+                decomp_logit = decomp_aux_logit.to(dtype=margin_logit.dtype)
+                decomp_loss = F.binary_cross_entropy_with_logits(decomp_logit, target_prob)
+                base_loss = base_loss + self.weight_decomp * decomp_loss
+
+                consistency_weight = float(
+                    getattr(
+                        self.config,
+                        "align_consistency_weight",
+                        getattr(self, "align_consistency_weight", 0.0),
+                    )
+                )
+                if consistency_weight > 0.0:
+                    main_prob = torch.sigmoid(margin_logit)
+                    decomp_prob = torch.sigmoid(decomp_logit)
+                    consistency_loss = F.mse_loss(decomp_prob, main_prob.detach())
+                    base_loss = base_loss + consistency_weight * consistency_loss
+
+        elif align_loss_type == "bce_yesprob":
+            # Map 1~5 score to yes probability target in [0, 1].
+            # 1 -> 0.0, 5 -> 1.0
+            target_prob = ((target - 1.0) / 4.0).clamp(0.0, 1.0).to(pred.dtype)
+            pred_prob = torch.sigmoid(pred)
+            base_loss = F.binary_cross_entropy(pred_prob, target_prob)
+        elif align_loss_type == "l1":
+            base_loss = F.l1_loss(pred, target)
+        else:
+            base_loss = F.mse_loss(pred, target)
+
+        soft_kl_weight = float(
+            getattr(
+                self.config,
+                "align_soft_kl_weight",
+                getattr(self, "align_soft_kl_weight", 0.0),
+            )
+        )
+        if soft_kl_weight <= 0.0:
+            return base_loss
+
+        tau = float(
+            getattr(
+                self.config,
+                "align_soft_kl_tau",
+                getattr(self, "align_soft_kl_tau", 0.5),
+            )
+        )
+        tau = max(tau, 1e-4)
+        pred_score_1to5 = 1.0 + 4.0 * torch.sigmoid(rank_pred)
+        pred_dist = _soft_level_dist(pred_score_1to5, tau)
+        target_dist = _soft_level_dist(target, tau)
+        kl_loss = F.kl_div(
+            torch.log(pred_dist.clamp_min(1e-8)),
+            target_dist,
+            reduction="batchmean",
+        )
+        return base_loss + soft_kl_weight * kl_loss
 
     def forward(self, input_type=None, **kwargs):
         if input_type is None:
@@ -349,12 +608,13 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
         elif input_type == "single":
             kwargs_desp = self.get_subitem(kwargs, task_type="description")
             kwargs_score = self.get_subitem(kwargs, task_type="score")
-            loss_desp = 0
+            kwargs_align = self.get_subitem(kwargs, task_type="alignment")
+            loss_desp = None
             if len(kwargs_desp["task_types"]) > 0:
                 del kwargs_desp["task_types"]
                 output_desp = self.forward_single(**kwargs_desp)
                 loss_desp = output_desp.loss
-            loss_score = 0
+            loss_score = None
             if len(kwargs_score["task_types"]) > 0:
                 del kwargs_score["task_types"]
                 output_score = self.forward_single(
@@ -362,18 +622,38 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
                                 **kwargs_score,
                             )
                 loss_score = output_score.loss
-            if dist.get_rank() == 0:
-                loss_desp_item = loss_desp if type(loss_desp) == int else loss_desp.item()
-                loss_score_item = loss_score if type(loss_score) == int else loss_score.item()
-                print(
-                    f"[loss (w/o weight) | "
-                    f"description loss: {round(loss_desp_item, 6)}, "
-                    f"score loss: {round(loss_score_item, 6)}]"
+            loss_align = None
+            if len(kwargs_align["task_types"]) > 0:
+                del kwargs_align["task_types"]
+                if getattr(self.config, "alignment_only_loss", True):
+                    kwargs_align["labels"] = None
+                output_align = self.forward_single(
+                    use_softkl_loss=False,
+                    use_alignment_branch=True,
+                    **kwargs_align,
                 )
-            loss = self.config.weight_desp * loss_desp + self.config.weight_next_token * loss_score
+                loss_align = output_align.loss
+            loss = None
+            if loss_desp is not None:
+                loss = self.config.weight_desp * loss_desp
+            if loss_score is not None:
+                term = self.config.weight_next_token * loss_score
+                loss = term if loss is None else (loss + term)
+            if loss_align is not None:
+                term = getattr(self.config, "weight_align", 1.0) * loss_align
+                loss = term if loss is None else (loss + term)
+            if loss is None:
+                # keep DeepSpeed happy: always return a tensor loss
+                loss = torch.zeros(
+                    (),
+                    device=self.lm_head.weight.device,
+                    dtype=self.lm_head.weight.dtype,
+                )
             return CausalLMOutputWithPast(loss=loss)
         elif input_type == "pair":
             return self.forward_pair(**kwargs)
+        elif input_type == "alignment":
+            return self.forward_alignment(**kwargs)
         else:
             raise ValueError
 
@@ -418,6 +698,8 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
         return_dict: Optional[bool] = None,
         use_softkl_loss: Optional[bool] = None,
         level_probs: Optional[torch.Tensor] = None,
+        align_scores: Optional[torch.Tensor] = None,
+        use_alignment_branch: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -459,6 +741,25 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
+        align_outputs = None
+        if use_alignment_branch:
+            if self.use_decomp_embeddings:
+                align_outputs = self.compute_decomp_alignment(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    modality_indicators=modality_indicators,
+                )
+            else:
+                zero = hidden_states.new_zeros(hidden_states.shape[0])
+                align_outputs = {
+                    "global_align_score": zero,
+                    "decomp_scores": None,
+                    "decomp_gate": None,
+                    "fused_decomp_score": zero,
+                    "final_align_score": zero,
+                    "diversity_loss": hidden_states.new_zeros(()),
+                }
+
         loss_kl = None
         if use_softkl_loss and labels is not None:
             loss_kl, idx_level_label, idx_level_logit = self.softkl_loss(logits, labels, level_probs)
@@ -496,19 +797,93 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
+        if loss is not None and loss_kl is not None:
+            loss = loss + self.config.weight_softkl * loss_kl
+
+        align_loss = None
+        diversity_loss = None
+        global_align_score = None
+        decomp_scores = None
+        decomp_gate = None
+        fused_decomp_score = None
+        final_align_score = None
+
+        if align_outputs is not None:
+            global_align_score = align_outputs["global_align_score"]
+            decomp_scores = align_outputs["decomp_scores"]
+            decomp_gate = align_outputs["decomp_gate"]
+            fused_decomp_score = align_outputs["fused_decomp_score"]
+            final_align_score = align_outputs["final_align_score"]
+            diversity_loss = align_outputs["diversity_loss"]
+
+            if align_scores is not None:
+                align_loss = self.compute_alignment_loss(
+                    final_align_score,
+                    align_scores,
+                    logits=logits,
+                    attention_mask=attention_mask,
+                    decomp_aux_logit=fused_decomp_score,
+                )
+                if torch.is_tensor(align_loss) and (not align_loss.requires_grad):
+                    align_loss = align_loss + logits.sum() * 0.0
+                if loss is None:
+                    loss = align_loss + self.weight_diversity * diversity_loss
+                else:
+                    loss = loss + align_loss + self.weight_diversity * diversity_loss
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        if loss is not None and loss_kl is not None:
-            loss = loss + self.config.weight_softkl * loss_kl
-
-        return CausalLMOutputWithPast(
+        return AlignmentOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            global_align_score=global_align_score,
+            decomp_scores=decomp_scores,
+            decomp_gate=decomp_gate,
+            fused_decomp_score=fused_decomp_score,
+            final_align_score=final_align_score,
+            diversity_loss=diversity_loss,
+            align_loss=align_loss,
+        )
+
+        # if not return_dict:
+        #     output = (logits,) + outputs[1:]
+        #     return (loss,) + output if loss is not None else output
+
+        # if loss is not None and loss_kl is not None:
+        #     loss = loss + self.config.weight_softkl * loss_kl
+
+        # return CausalLMOutputWithPast(
+        #     loss=loss,
+        #     logits=logits,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        # )
+
+    def forward_alignment(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        images=None,
+        align_scores=None,
+        return_dict=True,
+    ):
+        return self.forward_single(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            images=images,
+            return_dict=return_dict,
+            use_softkl_loss=False,
+            level_probs=None,
+            align_scores=align_scores,
+            use_alignment_branch=True,
         )
 
     def get_score(self, item):

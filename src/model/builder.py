@@ -27,6 +27,62 @@ from transformers.models.clip.image_processing_clip import CLIPImageProcessor
 
 from src.model import *
 
+def _load_non_lora_trainables(model, model_path):
+    """Load extra trainable weights saved alongside LoRA adapters."""
+    non_lora_path = os.path.join(model_path, "non_lora_trainables.bin")
+    non_lora_trainables = None
+    if os.path.exists(non_lora_path):
+        non_lora_trainables = torch.load(non_lora_path, map_location="cpu")
+    else:
+        # Try HF Hub if model_path is a repo_id.
+        try:
+            from huggingface_hub import hf_hub_download
+
+            cache_file = hf_hub_download(
+                repo_id=model_path,
+                filename="non_lora_trainables.bin",
+            )
+            non_lora_trainables = torch.load(cache_file, map_location="cpu")
+        except Exception:
+            non_lora_trainables = None
+
+    if non_lora_trainables is None:
+        print("No non_lora_trainables.bin found; skip loading extra weights.")
+        return
+
+    # Normalize PEFT-prefixed names to base model names.
+    normalized = {}
+    for k, v in non_lora_trainables.items():
+        nk = k
+        if nk.startswith("base_model.model."):
+            nk = nk[len("base_model.model.") :]
+        normalized[nk] = v
+
+    # If decomposition weights exist, make sure model has decomp modules before loading.
+    has_decomp = any("decomp_" in k or "global_align_head" in k for k in normalized)
+    if has_decomp and hasattr(model, "enable_decomp_embeddings"):
+        num_decomp_tokens = None
+        if "decomp_queries" in normalized:
+            try:
+                num_decomp_tokens = int(normalized["decomp_queries"].shape[0])
+            except Exception:
+                num_decomp_tokens = None
+        model.enable_decomp_embeddings(num_decomp_tokens)
+        print(
+            f"Enabled decomposition modules before loading extra weights "
+            f"(num_decomp_tokens={num_decomp_tokens})."
+        )
+
+    load_info = model.load_state_dict(normalized, strict=False)
+    missing = len(load_info.missing_keys) if hasattr(load_info, "missing_keys") else 0
+    unexpected = (
+        len(load_info.unexpected_keys) if hasattr(load_info, "unexpected_keys") else 0
+    )
+    print(
+        f"Loaded non-LoRA trainables: {len(normalized)} keys "
+        f"(missing={missing}, unexpected={unexpected})"
+    )
+
 
 def load_pretrained_model(
     model_path,
@@ -86,30 +142,7 @@ def load_pretrained_model(
                 )
 
             print("Loading additional mPLUG-Owl2 weights...")
-            if os.path.exists(os.path.join(model_path, "non_lora_trainables.bin")):
-                non_lora_trainables = torch.load(
-                    os.path.join(model_path, "non_lora_trainables.bin"),
-                    map_location="cpu",
-                )
-                print(non_lora_trainables.keys())
-            else:
-                # this is probably from HF Hub
-                from huggingface_hub import hf_hub_download
-
-                def load_from_hf(repo_id, filename, subfolder=None):
-                    cache_file = hf_hub_download(
-                        repo_id=repo_id, filename=filename, subfolder=subfolder
-                    )
-                    return torch.load(cache_file, map_location="cpu")
-
-                non_lora_trainables = load_from_hf(
-                    model_path, "non_lora_trainables.bin"
-                )
-            non_lora_trainables = {
-                (k[17:] if k.startswith("base_model.model.") else k): v
-                    for k, v in non_lora_trainables.items()
-                }
-            model.load_state_dict(non_lora_trainables, strict=False)
+            _load_non_lora_trainables(model, model_path)
 
             from peft import PeftModel
 
@@ -141,6 +174,8 @@ def load_pretrained_model(
             model = AutoModelForCausalLM.from_pretrained(
                 model_base, low_cpu_mem_usage=True, **kwargs
             )
+            print("Loading additional non-LoRA trainables (if available)...")
+            _load_non_lora_trainables(model, model_path)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
             print(f"Merging weights")

@@ -36,6 +36,28 @@ class SingleDataset(Dataset):
         self.list_data_dict = list_data_dict
         self.data_args = data_args
 
+    def _build_conversations(self, sample):
+        if "conversations" in sample and sample["conversations"]:
+            return sample["conversations"]
+
+        prompt = sample.get("prompt", "").strip()
+        task_type = sample.get("task_type", "score")
+        if task_type == "alignment":
+            user_q = (
+                "<|image|>\n"
+                f'Does this image match the text prompt "{prompt}"? '
+                "Please answer yes or no."
+            )
+            # Use a minimal answer token to keep training-time tokenization stable.
+            assistant_a = "Yes"
+        else:
+            user_q = "<|image|>\nPlease assess image quality and provide a score."
+            assistant_a = "The quality of the image is"
+        return [
+            {"from": "human", "value": user_q},
+            {"from": "gpt", "value": assistant_a},
+        ]
+
     def __len__(self):
         return len(self.list_data_dict)
 
@@ -44,9 +66,9 @@ class SingleDataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
+            conversations = self._build_conversations(sample)
             length_list.append(
-                sum(len(conv["value"].split()) for conv in sample["conversations"])
-                + img_tokens
+                sum(len(conv["value"].split()) for conv in conversations) + img_tokens
             )
         return length_list
 
@@ -54,8 +76,9 @@ class SingleDataset(Dataset):
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
+            conversations = self._build_conversations(sample)
             cur_len = sum(
-                len(conv["value"].split()) for conv in sample["conversations"]
+                len(conv["value"].split()) for conv in conversations
             )
             cur_len = cur_len if "image" in sample else -cur_len
             length_list.append(cur_len)
@@ -153,12 +176,12 @@ class SingleDataset(Dataset):
                                 "pixel_values"
                             ]
                     sources = preprocess_multimodal(
-                        copy.deepcopy([e["conversations"] for e in sources]),
+                        copy.deepcopy([self._build_conversations(e) for e in sources]),
                         self.data_args,
                     )
                 else:
 
-                    sources = copy.deepcopy([e["conversations"] for e in sources])
+                    sources = copy.deepcopy([self._build_conversations(e) for e in sources])
                 data_dict = preprocess(
                     sources,
                     self.tokenizer,
@@ -173,6 +196,13 @@ class SingleDataset(Dataset):
                 # default task_type: "score", level_probs: [-10000] * 5
                 data_dict["task_type"] = sources_org[0].get("task_type", "score")
                 data_dict["level_probs"] = sources_org[0].get("level_probs", [-10000] * 5)
+                data_dict["align_score"] = sources_org[0].get(
+                    "align_score",
+                    sources_org[0].get(
+                        "alignment_score",
+                        sources_org[0].get("mos_align", -10000.0),
+                    ),
+                )
 
                 # image exist in the data
                 if "image" in sources_org[0]:
@@ -217,6 +247,9 @@ class DataCollatorForSupervisedDataset(object):
 
         batch["task_types"] = [instance["task_type"] for instance in instances]
         batch["level_probs"] = torch.tensor([instance["level_probs"] for instance in instances])
+        batch["align_scores"] = torch.tensor(
+            [instance["align_score"] for instance in instances], dtype=torch.float32
+        )
 
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]

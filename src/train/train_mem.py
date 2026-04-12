@@ -16,6 +16,7 @@
 
 import logging
 import os
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -145,6 +146,24 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length: bool = field(default=False)
     save_safetensors: bool = False
 
+    # ===== New for latent decomposition =====
+    use_decomp_embeddings: bool = field(default=False)
+    num_decomp_tokens: int = field(default=4)
+    decomp_hidden_dim: int = field(default=4096)
+    weight_align: float = field(default=1.0)
+    alignment_only_loss: bool = field(default=True)
+    weight_decomp: float = field(default=1.0)
+    weight_diversity: float = field(default=0.01)
+    decomp_fusion_type: str = field(default="gated_sum")   # choices: gated_sum / mean
+    align_loss_type: str = field(default="mse")            # mse / l1 / bce_yesprob / vqa_yesprob_bce
+    align_yes_token: str = field(default="yes")
+    align_no_token: str = field(default="no")
+    align_soft_kl_weight: float = field(default=0.0)
+    align_soft_kl_tau: float = field(default=0.5)
+    align_consistency_weight: float = field(default=0.0)
+    align_rank_weight: float = field(default=0.0)
+    align_rank_margin: float = field(default=0.0)
+
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -221,7 +240,7 @@ def find_all_lora_names(model):
             lora_module_names.add(name)
 
     ls = list(lora_module_names)
-    print(ls)
+    rank0_print(f"[LoRA targets] num_modules={len(ls)}")
     return ls
 
 
@@ -307,14 +326,22 @@ def train():
             )
         )
 
+    attn_impl = "flash_attention_2"
+    if importlib.util.find_spec("flash_attn") is None:
+        rank0_print("flash_attn not found, fallback to eager attention.")
+        attn_impl = "eager"
+
     model = MPLUGOwl2LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
         torch_dtype=compute_dtype,
         **bnb_model_from_pretrained_args,
     )
-    print(model.config)
+    if training_args.use_decomp_embeddings and hasattr(model, "enable_decomp_embeddings"):
+        model.enable_decomp_embeddings(training_args.num_decomp_tokens)
+    rank0_print("[Model config loaded]")
+    rank0_print(model.config)
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
@@ -431,9 +458,53 @@ def train():
         ]  # index 1: no need start token
     model.config.image_aspect_ratio = data_args.image_aspect_ratio
     model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
+
+    model.config.use_decomp_embeddings = training_args.use_decomp_embeddings
+    model.config.num_decomp_tokens = training_args.num_decomp_tokens
+    model.config.decomp_hidden_dim = training_args.decomp_hidden_dim
+    model.config.weight_align = training_args.weight_align
+    model.config.alignment_only_loss = training_args.alignment_only_loss
+    model.config.weight_decomp = training_args.weight_decomp
+    model.config.weight_diversity = training_args.weight_diversity
+    model.config.decomp_fusion_type = training_args.decomp_fusion_type
+    model.config.align_loss_type = training_args.align_loss_type
+    model.config.align_soft_kl_weight = training_args.align_soft_kl_weight
+    model.config.align_soft_kl_tau = training_args.align_soft_kl_tau
+    model.config.align_consistency_weight = training_args.align_consistency_weight
+    model.config.align_rank_weight = training_args.align_rank_weight
+    model.config.align_rank_margin = training_args.align_rank_margin
+    # Keep runtime attrs in sync with config (used by model forward/loss code).
+    model.align_loss_type = model.config.align_loss_type
+    model.align_soft_kl_weight = model.config.align_soft_kl_weight
+    model.align_soft_kl_tau = model.config.align_soft_kl_tau
+    model.align_consistency_weight = model.config.align_consistency_weight
+    model.align_rank_weight = model.config.align_rank_weight
+    model.align_rank_margin = model.config.align_rank_margin
+    yes_ids = tokenizer(
+        training_args.align_yes_token, add_special_tokens=False
+    )["input_ids"]
+    no_ids = tokenizer(
+        training_args.align_no_token, add_special_tokens=False
+    )["input_ids"]
+    model.config.align_yes_token_id = yes_ids[0]
+    model.config.align_no_token_id = no_ids[0]
+
     for n, p in model.named_parameters():
         if training_args.lora_enable:
-            p.requires_grad = True if "lora_" in n else False
+            trainable = "lora_" in n
+            if training_args.use_decomp_embeddings:
+                trainable = trainable or any(
+                    key in n
+                    for key in (
+                        "global_align_head",
+                        "decomp_align_head",
+                        "decomp_gate",
+                        "decomp_queries",
+                        "decomp_key_proj",
+                        "decomp_value_proj",
+                    )
+                )
+            p.requires_grad = trainable
             # if "lm_head" in n:
             #     print(n)
             #     p.requires_grad = True
@@ -445,14 +516,14 @@ def train():
     model.config.tune_visual_abstractor = model_args.tune_visual_abstractor = (
         training_args.tune_visual_abstractor
     )
-    print(training_args.tune_visual_abstractor)
+    rank0_print(f"[Train flag] tune_visual_abstractor={training_args.tune_visual_abstractor}")
     model.get_model().visual_abstractor.requires_grad_(False)
     if training_args.tune_visual_abstractor:
         for n, p in model.get_model().visual_abstractor.named_parameters():
             p.requires_grad = True
 
     model.config.freeze_vision_model = training_args.freeze_vision_model
-    print(training_args.freeze_vision_model)
+    rank0_print(f"[Train flag] freeze_vision_model={training_args.freeze_vision_model}")
     model.get_model().vision_model.requires_grad_(True)
     if training_args.freeze_vision_model:
         for p in model.get_model().vision_model.parameters():
@@ -481,6 +552,49 @@ def train():
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
 
+    def _lora_stats(named_params):
+        stats = {
+            "num_A": 0,
+            "num_B": 0,
+            "mean_abs_A": 0.0,
+            "mean_abs_B": 0.0,
+            "nan_A": 0,
+            "nan_B": 0,
+        }
+        sum_a, sum_b = 0.0, 0.0
+        for n, p in named_params:
+            # Under ZeRO-3, gather partitioned params before computing stats.
+            t = maybe_zero_3(p, ignore_status=True, name=n).float()
+            if t.numel() == 0:
+                continue
+            has_nan = torch.isnan(t).any().item()
+            if "lora_A" in n:
+                stats["num_A"] += 1
+                if has_nan:
+                    stats["nan_A"] += 1
+                    continue
+                sum_a += t.abs().mean().item()
+            elif "lora_B" in n:
+                stats["num_B"] += 1
+                if has_nan:
+                    stats["nan_B"] += 1
+                    continue
+                sum_b += t.abs().mean().item()
+        if stats["num_A"] > 0:
+            valid_a = max(stats["num_A"] - stats["nan_A"], 1)
+            stats["mean_abs_A"] = sum_a / valid_a
+        if stats["num_B"] > 0:
+            valid_b = max(stats["num_B"] - stats["nan_B"], 1)
+            stats["mean_abs_B"] = sum_b / valid_b
+        return stats
+
+    if training_args.lora_enable and (training_args.local_rank in (-1, 0)):
+        s0 = _lora_stats(model.named_parameters())
+        rank0_print(
+            f"[LoRA stats before train] A: n={s0['num_A']} nan={s0['nan_A']} mean_abs={s0['mean_abs_A']:.8f} | "
+            f"B: n={s0['num_B']} nan={s0['nan_B']} mean_abs={s0['mean_abs_B']:.8f}"
+        )
+
     # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
     #     trainer.train(resume_from_checkpoint=True)
     # else:
@@ -490,6 +604,13 @@ def train():
     trainer.train()
 
     trainer.save_state()
+
+    if training_args.lora_enable and (training_args.local_rank in (-1, 0)):
+        s1 = _lora_stats(model.named_parameters())
+        rank0_print(
+            f"[LoRA stats after train]  A: n={s1['num_A']} nan={s1['nan_A']} mean_abs={s1['mean_abs_A']:.8f} | "
+            f"B: n={s1['num_B']} nan={s1['nan_B']} mean_abs={s1['mean_abs_B']:.8f}"
+        )
 
     model.config.use_cache = True
 

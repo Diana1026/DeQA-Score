@@ -15,9 +15,16 @@
 # result related
 *answer*
 *ckpt*
-*.json
-*.jsonl
 res_*
+
+# large local assets
+checkpoints/
+data/*/images/
+data/AIGCIQA2023/Image/
+*.zip
+
+# generated/local result files
+results/
 
 # mac hidden
 *.DS_Store*

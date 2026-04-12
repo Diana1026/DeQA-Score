@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 from io import BytesIO
 
@@ -46,117 +45,128 @@ def expand2square(pil_img, background_color):
         return result
 
 
-def build_question(text_prompt=None, fact=None):
+def build_prompt(conv_mode, text_prompt=None, fact=None):
     """
-    Build a VQA-style yes/no question.
-    """
-    if fact is not None:
-        return f'Does this image support the statement "{fact}"? Please answer yes or no.'
-    return f'Does this image match the text prompt "{text_prompt}"? Please answer yes or no.'
-
-
-def build_vqa_prompt(conv_mode, question):
-    """
-    Build the full conversational prompt for mPLUG-Owl2 / LLaVA-style model.
+    Build prompt for either full prompt scoring or fact-level scoring.
     """
     conv = conv_templates[conv_mode].copy()
-    inp = f"{DEFAULT_IMAGE_TOKEN}\n{question}"
-    conv.append_message(conv.roles[0], inp)
-    conv.append_message(conv.roles[1], None)
-    return conv.get_prompt()
 
-
-def aggregate_fact_scores(fact_scores, mode="mean", tau=5.0):
-    if len(fact_scores) == 0:
-        return None
-
-    if mode == "mean":
-        return sum(fact_scores) / len(fact_scores)
-
-    if mode == "min":
-        return min(fact_scores)
-
-    if mode == "softmin":
-        weights = [math.exp(-tau * s) for s in fact_scores]
-        denom = sum(weights) + 1e-12
-        return sum(w * s for w, s in zip(weights, fact_scores)) / denom
-
-    raise ValueError(f"Unsupported aggregation mode: {mode}")
-
-
-def sequence_probability_from_loss(loss_value):
-    """
-    Convert average CE loss to exp(-loss), matching VQAScore-style scoring.
-    """
-    return math.exp(-float(loss_value))
-
-
-def compute_answer_score(
-    model,
-    tokenizer,
-    image_tensor,
-    prompt,
-    answer,
-    device,
-):
-    """
-    Compute sequence probability score for a target answer under teacher forcing.
-    Score = exp(-loss(answer | prompt, image))
-    """
-    prompt_ids = tokenizer_image_token(
-        prompt,
-        tokenizer,
-        IMAGE_TOKEN_INDEX,
-        return_tensors="pt",
-    ).unsqueeze(0).to(device)
-
-    answer_ids = tokenizer(
-        answer,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"].to(device)
-
-    input_ids = torch.cat([prompt_ids, answer_ids], dim=1)
-
-    labels = input_ids.clone()
-    labels[:, : prompt_ids.shape[1]] = -100
-
-    with torch.inference_mode():
-        outputs = model(
-            input_ids=input_ids,
-            images=image_tensor.to(device, non_blocking=True),
-            labels=labels,
+    if fact is not None:
+        inp = (
+            "Given the image and a factual statement extracted from the caption, "
+            "rate how well the image supports this statement.\n"
+            f'Factual statement: "{fact}"\n'
+            f"{DEFAULT_IMAGE_TOKEN}"
+        )
+    else:
+        inp = (
+            "Given the text prompt and the image, rate how well the image matches the text prompt.\n"
+            f'Text prompt: "{text_prompt}"\n'
+            f"{DEFAULT_IMAGE_TOKEN}"
         )
 
-        if isinstance(outputs, dict):
-            loss = outputs["loss"]
-        else:
-            loss = outputs.loss
+    conv.append_message(conv.roles[0], inp)
+    conv.append_message(conv.roles[1], None)
 
-    return sequence_probability_from_loss(loss.item())
+    prompt = conv.get_prompt() + " The text-image alignment of this image is"
+    return prompt
+
+
+def pad_input_ids(input_ids_list, pad_token_id):
+    """
+    Pad variable-length tokenized prompts into a batch tensor.
+    """
+    max_len = max(x.shape[0] for x in input_ids_list)
+    padded = []
+    for x in input_ids_list:
+        pad_len = max_len - x.shape[0]
+        if pad_len > 0:
+            pad = torch.full(
+                (pad_len,),
+                pad_token_id,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            x = torch.cat([x, pad], dim=0)
+        padded.append(x)
+    return torch.stack(padded, dim=0)
+
+
+def compute_expected_score(prob_dict, toks):
+    """
+    Convert probability over rating words into a scalar expected score.
+    Default mapping:
+        excellent=5, good=4, fair=3, poor=2, bad=1
+    """
+    default_weights = {
+        "excellent": 5.0,
+        "good": 4.0,
+        "fair": 3.0,
+        "poor": 2.0,
+        "bad": 1.0,
+    }
+    score = 0.0
+    for tok in toks:
+        if tok not in default_weights:
+            continue
+        score += prob_dict.get(tok, 0.0) * default_weights[tok]
+    return score
+
+
+def aggregate_fact_scores(fact_scores, mode="mean"):
+    if len(fact_scores) == 0:
+        return None
+    if mode == "mean":
+        return sum(fact_scores) / len(fact_scores)
+    raise ValueError(f"Unsupported aggregation mode: {mode}")
 
 
 def flush_batch(
     model,
-    tokenizer,
     image_tensors,
+    batch_input_ids,
     batch_data,
+    pad_token_id,
+    toks,
+    ids_,
+    with_prob,
     save_path,
     device,
-    conv_mode,
-    aggregate_mode="mean",
-    debug=False,
 ):
     """
-    Score a batch sample-by-sample using VQA-style Yes/No sequence probabilities.
+    Run one batch through the model and append grouped results to save_path.
     Returns emptied batch containers.
     """
     if len(batch_data) == 0:
-        return [], []
+        return [], [], []
+
+    with torch.inference_mode():
+        batched_input_ids = pad_input_ids(batch_input_ids, pad_token_id).to(
+            device, non_blocking=True
+        )
+        batched_images = torch.cat(image_tensors, dim=0).to(
+            device, non_blocking=True
+        )
+
+        output_logits = model(
+            input_ids=batched_input_ids,
+            images=batched_images,
+        )["logits"][:, -1]
+
+        if with_prob:
+            output_probs = torch.softmax(output_logits, dim=1)
 
     grouped_results = {}
 
-    for image_tensor, entry in zip(image_tensors, batch_data):
+    for j, entry in enumerate(batch_data):
+        row_logits = {}
+        row_probs = {}
+
+        for tok, id_ in zip(toks, ids_):
+            row_logits[tok] = output_logits[j, id_].item()
+            if with_prob:
+                row_probs[tok] = output_probs[j, id_].item()
+
         sid = entry["sample_id"]
         if sid not in grouped_results:
             grouped_results[sid] = {
@@ -170,76 +180,39 @@ def flush_batch(
                 "fact_results": [],
             }
 
-        if entry["fact"] is not None:
-            question = build_question(fact=entry["fact"])
-        else:
-            question = build_question(text_prompt=entry["prompt"])
-
-        full_prompt = build_vqa_prompt(conv_mode, question)
-
-        score_yes = compute_answer_score(
-            model=model,
-            tokenizer=tokenizer,
-            image_tensor=image_tensor,
-            prompt=full_prompt,
-            answer="Yes",
-            device=device,
-        )
-        score_no = compute_answer_score(
-            model=model,
-            tokenizer=tokenizer,
-            image_tensor=image_tensor,
-            prompt=full_prompt,
-            answer="No",
-            device=device,
-        )
-
-        denom = score_yes + score_no + 1e-12
-        p_yes = score_yes / denom
-        p_no = score_no / denom
-
         fact_result = {
             "fact": entry["fact"],
             "fact_meta": entry["fact_meta"],
-            "question": question,
-            "score_yes": score_yes,
-            "score_no": score_no,
-            "p_yes": p_yes,
-            "p_no": p_no,
-            "fact_score": p_yes,
+            "logits": row_logits,
         }
 
-        if debug:
-            fact_result["full_prompt"] = full_prompt
+        if with_prob:
+            fact_result["probs"] = row_probs
+            fact_result["fact_score"] = compute_expected_score(row_probs, toks)
 
         grouped_results[sid]["fact_results"].append(fact_result)
 
     with open(save_path, "a", encoding="utf-8") as fw:
         for _, meta_res in grouped_results.items():
-            fact_scores = [
-                x["fact_score"]
-                for x in meta_res["fact_results"]
-                if "fact_score" in x
-            ]
-
-            meta_res["pred_score_mean"] = aggregate_fact_scores(
-                fact_scores, mode="mean"
-            )
-            meta_res["pred_score_min"] = aggregate_fact_scores(
-                fact_scores, mode="min"
-            )
-            meta_res["pred_score_softmin"] = aggregate_fact_scores(
-                fact_scores, mode="softmin"
-            )
-            meta_res["pred_score"] = aggregate_fact_scores(
-                fact_scores, mode=aggregate_mode
-            )
-            meta_res["aggregation_mode"] = aggregate_mode
-
+            if with_prob:
+                fact_scores = [
+                    x["fact_score"]
+                    for x in meta_res["fact_results"]
+                    if "fact_score" in x
+                ]
+                meta_res["pred_score"] = aggregate_fact_scores(
+                    fact_scores, mode="mean"
+                )
             fw.write(json.dumps(meta_res, ensure_ascii=False) + "\n")
 
+    del batched_input_ids
+    del batched_images
+    del output_logits
+    if with_prob:
+        del output_probs
     torch.cuda.empty_cache()
-    return [], []
+
+    return [], [], []
 
 
 def main(args):
@@ -260,8 +233,20 @@ def main(args):
     batch_size = args.batch_size
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
+    with_prob = args.with_prob
 
     conv_mode = args.conv_mode if args.conv_mode is not None else "mplug_owl2"
+
+    toks = args.level_names
+    print("Level names:", toks)
+
+    tokenized_levels = tokenizer(toks)["input_ids"]
+    ids_ = [id_[1] for id_ in tokenized_levels]
+    print("Token ids:", ids_)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
 
     for meta_path in meta_paths:
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -269,6 +254,7 @@ def main(args):
 
         image_tensors = []
         batch_data = []
+        batch_input_ids = []
 
         handled_ids = set()
         save_path = os.path.join(save_dir, os.path.basename(meta_path))
@@ -295,12 +281,10 @@ def main(args):
 
             image = load_image(filename)
             image = expand2square(
-                image,
-                tuple(int(x * 255) for x in image_processor.image_mean),
+                image, tuple(int(x * 255) for x in image_processor.image_mean)
             )
             image_tensor = image_processor.preprocess(
-                image,
-                return_tensors="pt",
+                image, return_tensors="pt"
             )["pixel_values"].half()
 
             if decomposition and isinstance(decomposition, list):
@@ -309,7 +293,16 @@ def main(args):
                     if not fact_text:
                         continue
 
+                    fact_prompt = build_prompt(conv_mode, fact=fact_text)
+                    input_ids = tokenizer_image_token(
+                        fact_prompt,
+                        tokenizer,
+                        IMAGE_TOKEN_INDEX,
+                        return_tensors="pt",
+                    )
+
                     image_tensors.append(image_tensor)
+                    batch_input_ids.append(input_ids)
                     batch_data.append(
                         {
                             "sample_id": llddata["id"],
@@ -325,19 +318,29 @@ def main(args):
                     )
 
                     if len(batch_data) >= batch_size:
-                        image_tensors, batch_data = flush_batch(
+                        image_tensors, batch_input_ids, batch_data = flush_batch(
                             model=model,
-                            tokenizer=tokenizer,
                             image_tensors=image_tensors,
+                            batch_input_ids=batch_input_ids,
                             batch_data=batch_data,
+                            pad_token_id=pad_token_id,
+                            toks=toks,
+                            ids_=ids_,
+                            with_prob=with_prob,
                             save_path=save_path,
                             device=args.device,
-                            conv_mode=conv_mode,
-                            aggregate_mode=args.aggregate_mode,
-                            debug=args.debug,
                         )
             else:
+                full_prompt = build_prompt(conv_mode, text_prompt=text_prompt)
+                input_ids = tokenizer_image_token(
+                    full_prompt,
+                    tokenizer,
+                    IMAGE_TOKEN_INDEX,
+                    return_tensors="pt",
+                )
+
                 image_tensors.append(image_tensor)
+                batch_input_ids.append(input_ids)
                 batch_data.append(
                     {
                         "sample_id": llddata["id"],
@@ -353,28 +356,31 @@ def main(args):
                 )
 
                 if len(batch_data) >= batch_size:
-                    image_tensors, batch_data = flush_batch(
+                    image_tensors, batch_input_ids, batch_data = flush_batch(
                         model=model,
-                        tokenizer=tokenizer,
                         image_tensors=image_tensors,
+                        batch_input_ids=batch_input_ids,
                         batch_data=batch_data,
+                        pad_token_id=pad_token_id,
+                        toks=toks,
+                        ids_=ids_,
+                        with_prob=with_prob,
                         save_path=save_path,
                         device=args.device,
-                        conv_mode=conv_mode,
-                        aggregate_mode=args.aggregate_mode,
-                        debug=args.debug,
                     )
 
-        image_tensors, batch_data = flush_batch(
+        # flush remaining samples
+        image_tensors, batch_input_ids, batch_data = flush_batch(
             model=model,
-            tokenizer=tokenizer,
             image_tensors=image_tensors,
+            batch_input_ids=batch_input_ids,
             batch_data=batch_data,
+            pad_token_id=pad_token_id,
+            toks=toks,
+            ids_=ids_,
+            with_prob=with_prob,
             save_path=save_path,
             device=args.device,
-            conv_mode=conv_mode,
-            aggregate_mode=args.aggregate_mode,
-            debug=args.debug,
         )
 
 
@@ -385,11 +391,14 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessor-path", type=str, default=None)
     parser.add_argument("--meta-paths", type=str, required=True, nargs="+")
     parser.add_argument("--root-dir", type=str, default="")
-    parser.add_argument("--save-dir", type=str, default="results_vqa_style")
+    parser.add_argument("--save-dir", type=str, default="results")
+    parser.add_argument("--level-names", type=str, required=True, nargs="+")
+    parser.add_argument("--with-prob", action="store_true")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--conv-mode", type=str, default="mplug_owl2")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--aggregate-mode", type=str, default="mean", choices=["mean", "min", "softmin"])
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
