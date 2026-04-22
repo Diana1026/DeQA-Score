@@ -46,6 +46,7 @@ class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
+    backbone: str = field(default="mplug")
 
 
 @dataclass
@@ -163,6 +164,17 @@ class TrainingArguments(transformers.TrainingArguments):
     align_consistency_weight: float = field(default=0.0)
     align_rank_weight: float = field(default=0.0)
     align_rank_margin: float = field(default=0.0)
+
+    # NRCA-style noise consistency regularizer for alignment:
+    # encourage the alignment prediction to be stable under mild visual perturbations.
+    align_noise_consistency_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for alignment noise-consistency loss (0 disables)."},
+    )
+    align_noise_std: float = field(
+        default=0.02,
+        metadata={"help": "Gaussian noise std added to CLIP pixel_values for the noisy view."},
+    )
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -299,6 +311,12 @@ def train():
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
+    if model_args.backbone.lower() != "mplug":
+        raise NotImplementedError(
+            f"Training backbone '{model_args.backbone}' is not implemented yet. "
+            "The current training/decomposition stack still depends on mPLUG-Owl2. "
+            "You can already use MiniCPM in the inference/evaluation path via --backbone minicpm_v25."
+        )
     compute_dtype = (
         torch.float16
         if training_args.fp16
@@ -473,6 +491,8 @@ def train():
     model.config.align_consistency_weight = training_args.align_consistency_weight
     model.config.align_rank_weight = training_args.align_rank_weight
     model.config.align_rank_margin = training_args.align_rank_margin
+    model.config.align_noise_consistency_weight = training_args.align_noise_consistency_weight
+    model.config.align_noise_std = training_args.align_noise_std
     # Keep runtime attrs in sync with config (used by model forward/loss code).
     model.align_loss_type = model.config.align_loss_type
     model.align_soft_kl_weight = model.config.align_soft_kl_weight
@@ -480,6 +500,8 @@ def train():
     model.align_consistency_weight = model.config.align_consistency_weight
     model.align_rank_weight = model.config.align_rank_weight
     model.align_rank_margin = model.config.align_rank_margin
+    model.align_noise_consistency_weight = model.config.align_noise_consistency_weight
+    model.align_noise_std = model.config.align_noise_std
     yes_ids = tokenizer(
         training_args.align_yes_token, add_special_tokens=False
     )["input_ids"]

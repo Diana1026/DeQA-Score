@@ -1,35 +1,51 @@
+#!/bin/bash
+
+# This script uses bash arrays. If invoked via `sh scripts/infer.sh ...`,
+# re-exec under bash so it still works (some systems link `sh` to `dash`).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 export CUDA_VISIBLE_DEVICES=$1
 export PYTHONPATH=./:$PYTHONPATH
+shift
 
-# python src/evaluate/iqa_eval_vqa.py \
-# 	--model-path MAGAer13/mplug-owl2-llama2-7b \
-# 	--save-dir results/mplug/ \
-# 	--preprocessor-path ./preprocessor/ \
-# 	--root-dir ./data/ \
-# 	--meta-paths ./data/GenAI-Bench/metas/all_alignment.json
+BACKBONE="${BACKBONE:-mplug}"
+MODEL_PATH="${MODEL_PATH:-./checkpoints/deqa_lora_2023}"
+MODEL_BASE="${MODEL_BASE:-zhiyuanyou/DeQA-Score-Mix3}"
+PREPROCESSOR_PATH="${PREPROCESSOR_PATH:-./preprocessor/}"
+SAVE_DIR="${SAVE_DIR:-results/deqa_lora/}"
+META_PATHS="${META_PATHS:-./data/AIGCIQA2023/metas/val_alignment.json}"
+DEVICE="${DEVICE:-cuda:0}"
+FUSE_ALPHA="${FUSE_ALPHA:-1.0}"
+PYTHON_BIN="python"
+if [ -x "./.venv/bin/python" ]; then
+  PYTHON_BIN="./.venv/bin/python"
+fi
 
-# python src/evaluate/iqa_eval_vqa_current.py \
-#   --model-path ./checkpoints/deqa_lora \
-#   --model-base zhiyuanyou/DeQA-Score-Mix3 \
-#   --save-dir results/deqa_lora/ \
-#   --preprocessor-path ./preprocessor/ \
-#   --meta-paths ./data/GenAI-Bench/metas/all_alignment.json
+ARGS=(
+  src/evaluate/iqa_eval_vqa_current.py
+  --backbone "$BACKBONE"
+  --model-path "$MODEL_PATH"
+  --save-dir "$SAVE_DIR"
+  --meta-paths "$META_PATHS"
+  --device "$DEVICE"
+  --fuse-alpha "$FUSE_ALPHA"
+)
 
-python src/evaluate/iqa_eval_vqa_current.py \
-  --model-path ./checkpoints/test \
-  --model-base zhiyuanyou/DeQA-Score-Mix3 \
-  --save-dir results/test/ \
-  --preprocessor-path ./preprocessor/ \
-  --meta-paths ./data/AIGCIQA2023/metas/val_alignment.json
+if [ -n "$PREPROCESSOR_PATH" ]; then
+  ARGS+=(--preprocessor-path "$PREPROCESSOR_PATH")
+fi
 
-	# ../data/KONIQ/metas/test_koniq_2k.json \
-				#  ../data/SPAQ/metas/test_spaq_2k.json \
-				#  ../data/KADID10K/metas/test_kadid_2k.json \
-				#  ../data/PIPAL/metas/test_pipal_5k.json \
-				#  ../data/LIVE-WILD/metas/test_livew_1k.json \
-				#  ../data/AGIQA3K/metas/test_agiqa_3k.json \
-				#  ../data/TID2013/metas/test_tid2013_3k.json \
-				#  ../data/CSIQ/metas/test_csiq_866.json \
+if [ "$BACKBONE" = "mplug" ] && [ -n "$MODEL_BASE" ]; then
+  ARGS+=(--model-base "$MODEL_BASE")
+fi
 
-#MAGAer13/mplug-owl2-llama2-7b 
-# --level-names excellent good fair poor bad \
+"$PYTHON_BIN" "${ARGS[@]}" "$@"
+
+# Examples:
+# BACKBONE=mplug MODEL_PATH=./checkpoints/test MODEL_BASE=zhiyuanyou/DeQA-Score-Mix3 \
+# SAVE_DIR=results/test META_PATHS=./data/AGIQA3K/metas/val_alignment.json sh scripts/infer.sh 0
+#
+# BACKBONE=minicpm_v25 MODEL_PATH=openbmb/MiniCPM-Llama3-V-2_5 MODEL_BASE= \
+# PREPROCESSOR_PATH=openbmb/MiniCPM-Llama3-V-2_5 SAVE_DIR=results/minicpm \
+# META_PATHS=./data/AIGCIQA2023/metas/val_alignment.json sh scripts/infer.sh 0

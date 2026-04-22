@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import re
 from io import BytesIO
 
 import requests
@@ -12,7 +13,7 @@ from tqdm import tqdm
 from src.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from src.conversation import conv_templates
 from src.mm_utils import get_model_name_from_path, tokenizer_image_token
-from src.model.builder import load_pretrained_model
+from src.model.builder import load_pretrained_model, normalize_backbone_name
 
 
 def disable_torch_init():
@@ -47,6 +48,15 @@ def build_question(text_prompt):
     return f'Does this image match the text prompt "{text_prompt}"? Please answer yes or no.'
 
 
+def build_minicpm_question(text_prompt):
+    return (
+        "Given the text prompt and the image, rate how well the image matches the text prompt "
+        'on a scale from 1 to 5, where 1 means completely mismatched and 5 means perfectly aligned.\n'
+        f'Text prompt: "{text_prompt}"\n'
+        "Respond with only one number from 1 to 5."
+    )
+
+
 def build_vqa_prompt(conv_mode, question):
     conv = conv_templates[conv_mode].copy()
     inp = f"{DEFAULT_IMAGE_TOKEN}\n{question}"
@@ -68,8 +78,16 @@ def resolve_yes_no_ids(model, tokenizer):
     return int(yes_ids[0]), int(no_ids[0])
 
 
+def parse_score_from_text(text):
+    match = re.search(r"(?<!\d)([1-5](?:\.\d+)?)", text)
+    if match is None:
+        raise ValueError(f"Cannot parse 1-5 score from MiniCPM response: {text!r}")
+    score = float(match.group(1))
+    return min(5.0, max(1.0, score))
+
+
 @torch.inference_mode()
-def infer_one(
+def infer_one_mplug(
     model,
     tokenizer,
     image_tensor,
@@ -140,8 +158,32 @@ def infer_one(
     return out
 
 
+def infer_one_minicpm(
+    model,
+    tokenizer,
+    image,
+    prompt,
+    keep_details=False,
+):
+    response = model.chat(
+        image=image,
+        msgs=[{"role": "user", "content": prompt}],
+        tokenizer=tokenizer,
+        sampling=False,
+    )
+    score = parse_score_from_text(response)
+    out = {
+        "pred_score_1to5": float(score),
+        "vqa_pred_score_1to5": float(score),
+    }
+    if keep_details:
+        out["raw_response"] = response
+    return out
+
+
 def main(args):
     disable_torch_init()
+    backbone = normalize_backbone_name(args.backbone)
 
     model_name = get_model_name_from_path(args.model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(
@@ -152,9 +194,12 @@ def main(args):
         args.load_4bit,
         device=args.device,
         preprocessor_path=args.preprocessor_path,
+        backbone=backbone,
     )
     model.eval()
-    yes_id, no_id = resolve_yes_no_ids(model, tokenizer)
+    yes_id, no_id = (None, None)
+    if backbone == "mplug":
+        yes_id, no_id = resolve_yes_no_ids(model, tokenizer)
 
     os.makedirs(args.save_dir, exist_ok=True)
     conv_mode = args.conv_mode if args.conv_mode is not None else "mplug_owl2"
@@ -181,27 +226,37 @@ def main(args):
                     continue
 
                 image = load_image(item["image"])
-                image = expand2square(
-                    image, tuple(int(x * 255) for x in image_processor.image_mean)
-                )
-                image_tensor = image_processor.preprocess(
-                    image, return_tensors="pt"
-                )["pixel_values"].half()
-
-                question = build_question(item["prompt"])
-                prompt = build_vqa_prompt(conv_mode, question)
-                pred = infer_one(
-                    model=model,
-                    tokenizer=tokenizer,
-                    image_tensor=image_tensor,
-                    prompt=prompt,
-                    yes_id=yes_id,
-                    no_id=no_id,
-                    device=args.device,
-                    use_align_residual=(not args.disable_align_residual),
-                    fuse_alpha=args.fuse_alpha,
-                    keep_details=args.debug,
-                )
+                if backbone == "mplug":
+                    image = expand2square(
+                        image, tuple(int(x * 255) for x in image_processor.image_mean)
+                    )
+                    image_tensor = image_processor.preprocess(
+                        image, return_tensors="pt"
+                    )["pixel_values"].half()
+                    question = build_question(item["prompt"])
+                    prompt = build_vqa_prompt(conv_mode, question)
+                    pred = infer_one_mplug(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image_tensor=image_tensor,
+                        prompt=prompt,
+                        yes_id=yes_id,
+                        no_id=no_id,
+                        device=args.device,
+                        use_align_residual=(not args.disable_align_residual),
+                        fuse_alpha=args.fuse_alpha,
+                        keep_details=args.debug,
+                    )
+                else:
+                    question = build_minicpm_question(item["prompt"])
+                    prompt = question
+                    pred = infer_one_minicpm(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image=image,
+                        prompt=prompt,
+                        keep_details=args.debug,
+                    )
 
                 meta_res = {
                     "id": item["id"],
@@ -249,6 +304,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, default="results_vqa_current")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--conv-mode", type=str, default="mplug_owl2")
+    parser.add_argument("--backbone", type=str, default="mplug")
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--disable-align-residual", action="store_true")

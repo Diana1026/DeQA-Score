@@ -1,0 +1,51 @@
+# Decomposition Module (Latent Slots) — Framework Diagram
+
+This diagram captures the "decomposition module" used by the mPLUG-Owl2 backbone for alignment, implemented in:
+
+- `src/model/modeling_mplug_owl2.py` (`MPLUGOwl2LlamaForCausalLM.enable_decomp_embeddings`)
+- `src/model/modeling_mplug_owl2.py` (`MPLUGOwl2LlamaForCausalLM.compute_decomp_alignment`)
+
+## Mermaid
+
+```mermaid
+%% See also: `fig/decomposition_module.mmd`
+flowchart TD
+  HS["Hidden states<br/>`hidden_states` [B,T,H]<br/>(from mPLUG-Owl2 decoder)"] --> KP["`decomp_key_proj`<br/>Linear(H→H)"]
+  HS --> VP["`decomp_value_proj`<br/>Linear(H→H)"]
+
+  DQ["Learned latent slots<br/>`decomp_queries` [K,H]"] --> DQX["Expand to batch<br/>[B,K,H]"]
+
+  KP --> KS["`key_states` [B,T,H]"]
+  VP --> VS["`value_states` [B,T,H]"]
+
+  DQX --> ATTNLOG["Attention logits<br/>`decomp_queries @ key_statesᵀ / sqrt(H)`<br/>[B,K,T]"]
+  KS --> ATTNLOG
+
+  AM["`attention_mask` [B,T] (optional)"] --> MASK
+  MI["`modality_indicators` [B,T] (optional)<br/>mask to text tokens"] --> MASK
+  ATTNLOG --> MASK["Mask logits<br/>set masked to -1e4"]
+  MASK --> ATTN["Softmax over T<br/>`attn` [B,K,T]"]
+
+  ATTN --> REPR["Slot representations<br/>`decomp_repr = attn @ value_states`<br/>[B,K,H]"]
+  VS --> REPR
+
+  REPR --> SCOREH["`decomp_align_head`<br/>MLP(H→H→1)"]
+  REPR --> GATEH["`decomp_gate`<br/>MLP(H→H→1)"]
+
+  SCOREH --> DS["`decomp_scores` [B,K]"]
+  GATEH --> GL["`gate_logits` [B,K]"]
+  GL --> G["Softmax over K<br/>`decomp_gate` [B,K]"]
+
+  DS --> FUSE
+  G --> FUSE["Fuse K slots<br/>`mean` or `Σ gate·score`"]
+  FUSE --> FDS["`fused_decomp_score` [B]"]
+  FDS --> FAS["Final align score<br/>`final_align_score = weight_decomp * fused_decomp_score` [B]"]
+
+  DQ --> DIV["Diversity loss<br/>normalize `decomp_queries` → similarity matrix vs identity"]
+```
+
+## Notes
+
+- The module is activated when `use_alignment_branch=True` and `use_decomp_embeddings=True` in `MPLUGOwl2LlamaForCausalLM.forward`.
+- Extra weights that include `decomp_*` tensors can trigger creation of these modules at load time via `src/model/builder.py` (`_load_non_lora_trainables`).
+

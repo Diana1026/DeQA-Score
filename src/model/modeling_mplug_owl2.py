@@ -359,6 +359,10 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
         self.align_consistency_weight = getattr(config, "align_consistency_weight", 0.0)
         self.align_rank_weight = getattr(config, "align_rank_weight", 0.0)
         self.align_rank_margin = getattr(config, "align_rank_margin", 0.0)
+        self.align_noise_consistency_weight = getattr(
+            config, "align_noise_consistency_weight", 0.0
+        )
+        self.align_noise_std = getattr(config, "align_noise_std", 0.02)
 
         hidden_size = config.hidden_size
 
@@ -700,7 +704,16 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
         level_probs: Optional[torch.Tensor] = None,
         align_scores: Optional[torch.Tensor] = None,
         use_alignment_branch: Optional[bool] = False,
+        _skip_align_noise_consistency: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        # Keep a copy of the raw (pre-multimodal-prepare) inputs. During multimodal preparation,
+        # `input_ids` may become `None` (replaced by `inputs_embeds`), but for a second noisy-view
+        # forward we want to start from the same raw tokens.
+        raw_input_ids = input_ids
+        raw_attention_mask = attention_mask
+        raw_images = images
+        raw_past_key_values = past_key_values
+
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -824,6 +837,73 @@ class MPLUGOwl2LlamaForCausalLM(LlamaForCausalLM, MPLUGOwl2MetaForCausalLM):
                     attention_mask=attention_mask,
                     decomp_aux_logit=fused_decomp_score,
                 )
+
+                # NRCA-style noise-consistency for alignment: enforce stable yes/no alignment probability
+                # between the clean image and a mildly perturbed image. We detach the clean prediction to
+                # act as a teacher signal for the noisy view.
+                noise_w = float(
+                    getattr(
+                        self.config,
+                        "align_noise_consistency_weight",
+                        getattr(self, "align_noise_consistency_weight", 0.0),
+                    )
+                )
+                noise_std = float(
+                    getattr(
+                        self.config,
+                        "align_noise_std",
+                        getattr(self, "align_noise_std", 0.02),
+                    )
+                )
+                if (
+                    noise_w > 0.0
+                    and (not _skip_align_noise_consistency)
+                    and self.training
+                    and images is not None
+                    and logits is not None
+                    and attention_mask is not None
+                ):
+                    yes_id = getattr(self.config, "align_yes_token_id", None)
+                    no_id = getattr(self.config, "align_no_token_id", None)
+                    if yes_id is not None and no_id is not None and noise_std > 0.0:
+                        valid = align_scores > -1e4
+                        if valid.any():
+                            # Extract the yes/no margin at the last prompt token position.
+                            def _margin_prob(current_logits: torch.Tensor) -> torch.Tensor:
+                                logits_valid = current_logits[valid]
+                                attn_valid = attention_mask[valid]
+                                last_pos = attn_valid.long().sum(dim=1) - 1
+                                vocab_size = logits_valid.shape[-1]
+                                gather_index = last_pos.view(-1, 1, 1).expand(-1, 1, vocab_size)
+                                next_logits = logits_valid.gather(dim=1, index=gather_index).squeeze(1)
+                                margin = next_logits[:, yes_id] - next_logits[:, no_id]
+                                return torch.sigmoid(margin)
+
+                            clean_prob = _margin_prob(logits).detach()
+
+                            # Noisy forward pass (same tokens; perturbed pixel_values).
+                            noisy_images = raw_images + torch.randn_like(raw_images) * noise_std
+                            noisy_out = self.forward_single(
+                                input_ids=raw_input_ids,
+                                attention_mask=raw_attention_mask,
+                                past_key_values=raw_past_key_values,
+                                inputs_embeds=None,
+                                labels=None,
+                                use_cache=use_cache,
+                                output_attentions=output_attentions,
+                                output_hidden_states=output_hidden_states,
+                                images=noisy_images,
+                                return_dict=True,
+                                use_softkl_loss=False,
+                                level_probs=level_probs,
+                                align_scores=None,
+                                use_alignment_branch=True,
+                                _skip_align_noise_consistency=True,
+                            )
+                            noisy_prob = _margin_prob(noisy_out.logits)
+                            noise_consistency_loss = F.mse_loss(noisy_prob, clean_prob)
+                            align_loss = align_loss + noise_w * noise_consistency_loss
+
                 if torch.is_tensor(align_loss) and (not align_loss.requires_grad):
                     align_loss = align_loss + logits.sum() * 0.0
                 if loss is None:

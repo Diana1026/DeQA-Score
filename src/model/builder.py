@@ -13,12 +13,15 @@
 #    limitations under the License.
 
 
+import importlib.util
 import os
 import warnings
+from typing import Optional
 
 import torch
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -26,6 +29,25 @@ from transformers import (
 from transformers.models.clip.image_processing_clip import CLIPImageProcessor
 
 from src.model import *
+
+
+def normalize_backbone_name(backbone: Optional[str]) -> str:
+    if backbone is None:
+        return "mplug"
+    name = backbone.lower().strip()
+    aliases = {
+        "mplug": "mplug",
+        "mplug_owl2": "mplug",
+        "minicpm": "minicpm_v25",
+        "minicpm_v25": "minicpm_v25",
+        "minicpm-v25": "minicpm_v25",
+        "minicpm_llama3_v_2_5": "minicpm_v25",
+        "minicpm-llama3-v-2_5": "minicpm_v25",
+        "minicpm-llama3-v-2.5": "minicpm_v25",
+    }
+    if name not in aliases:
+        raise ValueError(f"Unsupported backbone: {backbone}")
+    return aliases[name]
 
 def _load_non_lora_trainables(model, model_path):
     """Load extra trainable weights saved alongside LoRA adapters."""
@@ -93,10 +115,31 @@ def load_pretrained_model(
     device_map="auto",
     device="cuda",
     preprocessor_path=None,
+    backbone="mplug",
 ):
+    backbone = normalize_backbone_name(backbone)
     kwargs = {"device_map": device_map}
 
-    if device != "cuda":
+    device_str = str(device)
+    use_fp16 = device_str.startswith("cuda")
+
+    # Allows pinning Hugging Face Hub downloads to avoid fetching new remote code.
+    # Only applies when loading from a Hub repo id (not a local path).
+    hub_revision = os.getenv("HF_REVISION")
+
+    def _maybe_revision(pretrained_model_name_or_path: str) -> Optional[str]:
+        if not hub_revision:
+            return None
+        # If it's a local path, `revision=` is irrelevant and can be confusing.
+        if os.path.exists(pretrained_model_name_or_path):
+            return None
+        return hub_revision
+
+    # For explicit single-device CUDA runs we pin the whole model to that device.
+    # For CPU, avoid `device_map` to prevent Accelerate offload/dispatch issues.
+    if device_str == "cpu":
+        kwargs.pop("device_map", None)
+    elif device != "cuda":
         kwargs["device_map"] = {"": device}
 
     if load_8bit:
@@ -110,12 +153,13 @@ def load_pretrained_model(
             bnb_4bit_quant_type="nf4",
         )
     else:
-        kwargs["torch_dtype"] = torch.float16
+        # FP16 on CPU will crash in some ops (e.g., vision conv2d); keep FP32 on CPU.
+        kwargs["torch_dtype"] = torch.float16 if use_fp16 else torch.float32
 
     if preprocessor_path is None:
         preprocessor_path = model_path
 
-    if "deqa" in model_name.lower():
+    if backbone == "mplug" and "deqa" in model_name.lower():
         # Load LLaVA model
         if "lora" in model_name.lower() and model_base is None:
             warnings.warn(
@@ -164,7 +208,7 @@ def load_pretrained_model(
             model = MPLUGOwl2LlamaForCausalLM.from_pretrained(
                 model_path, low_cpu_mem_usage=True, **kwargs
             )
-    else:
+    elif backbone == "mplug":
         # Load language model
         if model_base is not None:
             # PEFT model
@@ -180,13 +224,63 @@ def load_pretrained_model(
             model = PeftModel.from_pretrained(model, model_path)
             print(f"Merging weights")
             model = model.merge_and_unload()
-            print("Convert to FP16...")
-            model.to(torch.float16)
+            if use_fp16:
+                print("Convert to FP16...")
+                model.to(torch.float16)
         else:
             tokenizer = AutoTokenizer.from_pretrained(preprocessor_path, use_fast=False)
             model = AutoModelForCausalLM.from_pretrained(
                 model_path, low_cpu_mem_usage=True, **kwargs
             )
+    elif backbone == "minicpm_v25":
+        # Remote MiniCPM-V 2.5 code currently depends on Idefics2 components that
+        # are not present in older Transformers versions.
+        if importlib.util.find_spec("transformers.models.idefics2") is None:
+            raise ModuleNotFoundError(
+                "Missing `transformers.models.idefics2`. Please upgrade `transformers` "
+                "(and potentially `tokenizers`) to a newer version that includes "
+                "Idefics2 support before loading MiniCPM-V 2.5."
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            preprocessor_path,
+            use_fast=False,
+            trust_remote_code=True,
+            revision=_maybe_revision(preprocessor_path),
+        )
+        load_path = model_base if model_base is not None else model_path
+        model = AutoModel.from_pretrained(
+            load_path,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            revision=_maybe_revision(load_path),
+            **kwargs,
+        )
+        if model_base is not None:
+            print("Loading additional non-LoRA trainables (if available)...")
+            _load_non_lora_trainables(model, model_path)
+            from peft import PeftModel
+
+            print(f"Loading LoRA weights from {model_path}")
+            model = PeftModel.from_pretrained(model, model_path)
+            if hasattr(model, "merge_and_unload"):
+                print("Merging weights")
+                model = model.merge_and_unload()
+            if use_fp16:
+                print("Convert to FP16...")
+                model.to(torch.float16)
+        image_processor = None
+        if hasattr(model, "eval"):
+            model = model.eval()
+        if hasattr(model.config, "max_position_embeddings"):
+            context_len = model.config.max_position_embeddings
+        elif hasattr(model.config, "max_sequence_length"):
+            context_len = model.config.max_sequence_length
+        else:
+            context_len = 2048
+        return tokenizer, model, image_processor, context_len
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone}")
 
     # vision_tower = model.get_model().vision_model
     # print(vision_tower.device)

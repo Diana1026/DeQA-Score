@@ -117,6 +117,7 @@ class LlamaConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         attention_bias=False,
+        mlp_bias=False,
         attention_dropout=0.0,
         **kwargs,
     ):
@@ -141,6 +142,7 @@ class LlamaConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
         self.attention_dropout = attention_dropout
 
         super().__init__(
